@@ -2,6 +2,7 @@
 import math
 import argparse
 import warnings
+import contextlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,6 +18,16 @@ try:
 except Exception as e:
     TE_AVAILABLE = False
     print("Transformer Engine not available:", e)
+    pass
+
+# Detect optional FP4 autocast context in TE (Blackwell-only feature)
+TE_FP4_CTX = None
+if TE_AVAILABLE:
+    # Known TE context manager names across versions
+    for _name in ("fp4_autocast", "mxfp4_autocast", "fp4_autocast_guard"):
+        TE_FP4_CTX = getattr(te, _name, None)
+        if TE_FP4_CTX is not None:
+            break
 
 # Vanilla GPT2-style block (naive attention)
 class GPTDecoderBlock(nn.Module):
@@ -106,7 +117,7 @@ class TETransformerBlock(nn.Module):
 
 # Bench harness
 @torch.inference_mode(False)            # force inference mode OFF; allow autograd for training
-def bench(model, device, dtype, B, T, steps=50, warmup=10, use_fp8=False, fp8_recipe=None):
+def bench(model, device, dtype, B, T, steps=50, warmup=10, use_fp4=False, use_fp8=False, fp8_recipe=None):
     model.to(device, dtype=dtype).train()     # move model to GPU with dtype; set train() (dropout/ln behavior)
     x_base = torch.randn(B, T, model.hidden_size, device=device, dtype=dtype)  # fixed input tensor template
 
@@ -127,7 +138,11 @@ def bench(model, device, dtype, B, T, steps=50, warmup=10, use_fp8=False, fp8_re
         x = x_base.detach().requires_grad_(True)  # fresh leaf tensor each iter; track grads
 
         torch.cuda.synchronize(); start.record()  # flush GPU work; start timer
-        if use_fp8:
+        if use_fp4 and TE_AVAILABLE and TE_FP4_CTX is not None and torch.cuda.get_device_capability()[0] >= 10:
+            # Try FP4 autocast on Blackwell; fall back silently if the context is unavailable.
+            with TE_FP4_CTX(enabled=True):
+                out = model(x)
+        elif use_fp8:
             with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):  # enable TE FP8 scaling
                 out = model(x)                   # forward pass
         else:
@@ -191,6 +206,15 @@ def main():
         ms3, tps3, mem3, fwd3, bwd3 = bench(te_block, device, dtype, args.batch, args.seq, args.steps, args.warmup,
                                 use_fp8=True, fp8_recipe=recipe)
         print(f"[3] TE + FP8:            {ms3:6.2f} ms/iter | fwd {fwd3:6.2f} ms | bwd {bwd3:6.2f} ms | {tps3:,.0f} tok/s | peak {mem3:.2f} GB")
+
+        # 4) TE + FP4 (Blackwell only; requires TE FP4 context)
+        is_blackwell = torch.cuda.get_device_capability()[0] >= 10
+        if is_blackwell and TE_FP4_CTX is not None:
+            ms4, tps4, mem4, fwd4, bwd4 = bench(te_block, device, dtype, args.batch, args.seq, args.steps, args.warmup,
+                                                use_fp4=True)
+            print(f"[4] TE + FP4:            {ms4:6.2f} ms/iter | fwd {fwd4:6.2f} ms | bwd {bwd4:6.2f} ms | {tps4:,.0f} tok/s | peak {mem4:.2f} GB")
+        else:
+            print("[4] TE + FP4:            skipped (no FP4 context or non-Blackwell GPU)")
     else:
         print("Transformer Engine not installed — skipping TE runs.")
 
