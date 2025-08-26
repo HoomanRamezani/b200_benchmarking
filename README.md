@@ -1,4 +1,5 @@
 # Transformer Engine (TE) optimizations
+Code from Cyril Kondratenko
 
 ## Examine the script
 
