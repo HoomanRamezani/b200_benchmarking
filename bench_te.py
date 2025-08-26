@@ -105,41 +105,52 @@ class TETransformerBlock(nn.Module):
         return self.layer(x, self_attn_mask_type="causal")
 
 # Bench harness
-@torch.inference_mode(False)
+@torch.inference_mode(False)            # force inference mode OFF; allow autograd for training
 def bench(model, device, dtype, B, T, steps=50, warmup=10, use_fp8=False, fp8_recipe=None):
-    model.to(device, dtype=dtype).train()
-    x_base = torch.randn(B, T, model.hidden_size, device=device, dtype=dtype)
+    model.to(device, dtype=dtype).train()     # move model to GPU with dtype; set train() (dropout/ln behavior)
+    x_base = torch.randn(B, T, model.hidden_size, device=device, dtype=dtype)  # fixed input tensor template
 
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)   # optimizer for update timing realism
+    torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(device)        # clear cache; reset peak mem counter
+    torch.backends.cuda.matmul.allow_tf32 = True            # enable TF32 tensorcore matmuls (Ampere+)
+    torch.backends.cudnn.allow_tf32 = True                  # enable TF32 in cuDNN ops
 
-    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-    times = []
+    start = torch.cuda.Event(True)
+    fwd_end = torch.cuda.Event(True)
+    bwd_end = torch.cuda.Event(True)
+    end = torch.cuda.Event(True)                                 # CUDA timestamp events
+    times = []                                                   # per-iteration elapsed times (ms)
+    times_fwd = []                                               # per-iteration forward times (ms)
+    times_bwd = []                                               # per-iteration backward times (ms)
     for it in range(warmup + steps):
-        opt.zero_grad(set_to_none=True)
-        x = x_base.detach().requires_grad_(True)
+        opt.zero_grad(set_to_none=True)        # zero grads efficiently (set tensors to None)
+        x = x_base.detach().requires_grad_(True)  # fresh leaf tensor each iter; track grads
 
-        torch.cuda.synchronize(); start.record()
+        torch.cuda.synchronize(); start.record()  # flush GPU work; start timer
         if use_fp8:
-            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-                out = model(x)
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):  # enable TE FP8 scaling
+                out = model(x)                   # forward pass
         else:
-            out = model(x)
-        loss = out.float().pow(2).mean()
-        loss.backward()
-        end.record()
-        torch.cuda.synchronize()
+            out = model(x)                       # forward pass
+        fwd_end.record()                         # mark end of forward pass
+        loss = out.float().pow(2).mean()         # simple scalar loss (MSE on outputs)
+        loss.backward()                          # backward pass (compute grads)
+        bwd_end.record()                         # mark end of backward pass
+        end.record()                              # stop timer
+        torch.cuda.synchronize()                  # ensure all GPU work finished before reading time
 
-        opt.step()
-        if it >= warmup:
-            times.append(start.elapsed_time(end))
+        opt.step()                                # optimizer update (includes param writes)
+        if it >= warmup:                          # skip warmup iterations
+            times.append(start.elapsed_time(end)) # elapsed time in ms for this iter
+            times_fwd.append(start.elapsed_time(fwd_end))
+            times_bwd.append(fwd_end.elapsed_time(bwd_end))
 
-    ms = sum(times)/len(times)
-    tok_s = (B*T) / (ms/1000.0)
-    peak = torch.cuda.max_memory_allocated(device)/(1024**3)
-    return ms, tok_s, peak
+    ms = sum(times)/len(times)                    # average ms/iter over measured iters
+    fwd_ms = sum(times_fwd)/len(times_fwd)
+    bwd_ms = sum(times_bwd)/len(times_bwd)
+    tok_s = (B*T) / (ms/1000.0)                   # throughput: tokens/sec = (batch*seq)/seconds
+    peak = torch.cuda.max_memory_allocated(device)/(1024**3)  # peak allocated GPU memory (GiB)
+    return ms, tok_s, peak, fwd_ms, bwd_ms        # report latency, throughput, peak mem, and fwd/bwd times
 
 def main():
     parser = argparse.ArgumentParser()
@@ -163,23 +174,23 @@ def main():
 
     # 1) Vanilla PyTorch (naive attention)
     vanilla = GPTDecoderBlock(args.hidden, args.ffn_hidden, args.seq, args.heads, 0.0, 0.0)
-    ms1, tps1, mem1 = bench(vanilla, device, dtype, args.batch, args.seq, args.steps, args.warmup)
-    print(f"[1] Vanilla torch:        {ms1:6.2f} ms/iter | {tps1:,.0f} tok/s | peak {mem1:.2f} GB")
+    ms1, tps1, mem1, fwd1, bwd1 = bench(vanilla, device, dtype, args.batch, args.seq, args.steps, args.warmup)
+    print(f"[1] Vanilla torch:        {ms1:6.2f} ms/iter | fwd {fwd1:6.2f} ms | bwd {bwd1:6.2f} ms | {tps1:,.0f} tok/s | peak {mem1:.2f} GB")
 
     if TE_AVAILABLE:
         # 2) TE fused kernels
         te_block = TETransformerBlock(args.hidden, args.ffn_hidden, args.heads, 0.0, 0.0)
-        ms2, tps2, mem2 = bench(te_block, device, dtype, args.batch, args.seq, args.steps, args.warmup)
-        print(f"[2] TE fused kernels:    {ms2:6.2f} ms/iter | {tps2:,.0f} tok/s | peak {mem2:.2f} GB")
+        ms2, tps2, mem2, fwd2, bwd2 = bench(te_block, device, dtype, args.batch, args.seq, args.steps, args.warmup)
+        print(f"[2] TE fused kernels:    {ms2:6.2f} ms/iter | fwd {fwd2:6.2f} ms | bwd {bwd2:6.2f} ms | {tps2:,.0f} tok/s | peak {mem2:.2f} GB")
 
         # 3) TE + FP8
         recipe = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16, amax_compute_algo='max')
         if args.fp8_attn:
             recipe.fp8_dpa = True
             recipe.fp8_mha = True
-        ms3, tps3, mem3 = bench(te_block, device, dtype, args.batch, args.seq, args.steps, args.warmup,
+        ms3, tps3, mem3, fwd3, bwd3 = bench(te_block, device, dtype, args.batch, args.seq, args.steps, args.warmup,
                                 use_fp8=True, fp8_recipe=recipe)
-        print(f"[3] TE + FP8:            {ms3:6.2f} ms/iter | {tps3:,.0f} tok/s | peak {mem3:.2f} GB")
+        print(f"[3] TE + FP8:            {ms3:6.2f} ms/iter | fwd {fwd3:6.2f} ms | bwd {bwd3:6.2f} ms | {tps3:,.0f} tok/s | peak {mem3:.2f} GB")
     else:
         print("Transformer Engine not installed — skipping TE runs.")
 
